@@ -96,7 +96,7 @@ rm(mofa_res, cox_res, factor_data_cox)
 
 # Identify the optimal number of clusters for unsupervised clustering
 NbClust::NbClust(data = factor_data, diss = NULL, 
-                 distance = "euclidean",  min.nc = 2, max.nc = 7, method = "kmeans", 
+                 distance = "euclidean",  min.nc = 2, max.nc = 10, method = "kmeans", 
                  index = "all", alphaBeale = 0.1)
 # The establishment of MotifCC clusters
 ConsensusClusterPlus::ConsensusClusterPlus(t(factor_data), 
