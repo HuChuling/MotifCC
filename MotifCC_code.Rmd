@@ -1,0 +1,128 @@
+---
+title: "MotifCC code"
+author: "Chuling Hu"
+date: "2024-02-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(MOFA2)
+library(reticulate)
+library(DeepCC)
+library(NbClust)
+library(ConsensusClusterPlus)
+use_python(python="/data/home/user1/.local/share/r-miniconda/envs/r-reticulate/bin/python")
+```
+
+
+```{r}
+# Obtain the "clin" dataframe
+load(file = "./UCSC/TCGA/COAD_and_READ/clinical.RData")   
+# Obtain the "exp" dataframe
+load(file = "./UCSC/TCGA/COAD_and_READ/expression_log_tpm.RData") 
+# Obtain the "cnv" dataframe
+load(file = "./UCSC/TCGA/COAD_and_READ/CNV.RData")     
+# Obtain the "met" dataframe
+load(file = "./UCSC/TCGA/COAD_and_READ/methylation.RData")        
+
+# Obtain a list of 1793 immune-related genes from the ImmPort database
+# Obtain the "gene_list" character vector
+load("./immport_immune_gene_list.RData")
+
+# Extract multi-omics immune-related feature 
+exp_feature <- intersect(gene_list, colnames(exp))
+cnv_feature <- intersect(gene_list, colnames(cnv))
+
+# Obtain methylation loci annotation information
+# Extract immune-related methylation feature
+met_anno <- read_csv(file = "./HumanMethylation27_270596_v.1.2.csv", skip = 7) %>% 
+  dplyr::select("IlmnID", "Symbol") %>% 
+  dplyr::filter(IlmnID %in% colnames(met)) %>% 
+  dplyr::filter(Symbol %in% immport_gene_symbol)
+
+# Multi-omics immune-related data
+exp <- exp[exp_feature, ]
+cnv <- cnv[cnv_feature, ]
+met <- met[unique(met_anno$IlmnID), ]
+tcga_data <- list(exp = as.matrix(exp),
+                  cnv = as.matrix(cnv),
+                  met = as.matrix(met))
+rm(exp, cnv, met, 
+   exp_feature, cnv_feature, met_anno, gene_list)
+```
+
+
+```{r}
+# Multi-omics modeling of the immune features using MOFA2 package
+object1 <- create_mofa_from_matrix(tcga_data, groups = NULL)
+train_opts <- get_default_training_options(object1)
+train_opts$maxiter <- 2000
+train_opts$convergence_mode <- "medium"
+train_opts$drop_factor_threshold <- -1
+train_opts$seed <- 12345
+object2 <- prepare_mofa(object1,
+                        data_options = list(scale_views = F, scale_groups = F, views = c("exp","cnv","met"),
+                                            center_groups = TRUE, use_float32 = FALSE, groups = "group1"),
+                        model_options = list(likelihoods = c(exp = "gaussian", cnv = "gaussian", met = "gaussian"), num_factors = 20,
+                                             spikeslab_factors = FALSE, spikeslab_weights = TRUE, ard_factors = FALSE, ard_weights = TRUE),
+                        training_options = train_opts,
+                        stochastic_options = NULL,
+                        mefisto_options = NULL)
+mofa_res <- run_mofa(object2, 
+                     outfile = "./mofa_res.hdf5", 
+                     save_data = FALSE, use_basilisk = FALSE)
+rm(object1, object2, train_opts)
+
+# Obtain a factor matrix containing 20 factors aggregating the multi-omics tumor immune features (MOTIFs) of each CRC sample
+factor_data <- as.data.frame(get_factors(mofa_res)$group1)
+# COX analysis performed on the 20 MOTIFs factors
+factor_data_cox <- as.data.frame(factor_data) %>% 
+    dplyr::mutate(id = rownames(factor_data)) %>% 
+    left_join(clin, by = "id") 
+cox_res <- as.data.frame(do.call(rbind, lapply(colnames(factor_data), function(i){
+  aa <- summary(survival::coxph(survival::Surv(dfs.time, dfs.event) ~ (get(i)), data=factor_data_cox))
+  c(factor = i, p = aa$coef[5], HR = aa$conf.int[1])
+  }))) %>% 
+    dplyr::transmute(Factor = factor,
+                     P = as.numeric(p),
+                     HR = as.numeric(HR))
+# Prognostic MOTIFs factors identified and selected for unsupervised clustering
+cox_res <- cox_res %>% 
+  dplyr::filter(p < 0.05)
+factor_data <- factor_data[, cox_res$Factor]
+rm(mofa_res, cox_res, factor_data_cox)
+
+# Identify the optimal number of clusters for unsupervised clustering
+NbClust::NbClust(data = factor_data, diss = NULL, 
+                 distance = "euclidean",  min.nc = 2, max.nc = 7, method = "kmeans", 
+                 index = "all", alphaBeale = 0.1)
+# The establishment of MotifCC clusters
+ConsensusClusterPlus::ConsensusClusterPlus(t(factor_data), 
+                                           maxK = 3, reps = 1000, pItem = 0.8, pFeature = 1, 
+                                           clusterAlg = "km", distance = "euclidean", 
+                                           title = "motifcc_cluster", plot = 'png',
+                                           writeTable = T)
+motifcc_cluster_tcga <- readr::read_csv(file = "./motifcc_cluster/motifcc_cluster.k=3.consensusClass.csv", col_names = F) %>% 
+  transmute(id = X1,
+            Cluster = factor(str_c("Cluster", X2, sep = ""), levels = c("Cluster1", "Cluster2", "Cluster3"))) 
+```
+
+
+```{r}
+# Independent validation of the MotifCC clustering model using independent in-house COCC cohort
+tcga_fs <- DeepCC::getFunctionalSpectra(tcga_data[["exp"]])
+motifcc_cluster_model <- DeepCC::train_DeepCC_model(tcga_fs, motifcc_cluster_tcga$Cluster)
+
+# Obtain MotifCC cluster label for patients of COCC cohort
+# Obtain the multi-omics data of COCC cohort
+load(file = "./COCC_multi_omics_data.RData")  
+cocc_fs <- DeepCC::getFunctionalSpectra(cocc_data[["exp"]])
+motifcc_cluster_cocc <- DeepCC::get_DeepCC_label(motifcc_cluster_model, cocc_fs)
+motifcc_cluster_cocc <- data.frame(id = rownames(cocc_fs),
+                                   Cluster = motifcc_cluster_cocc)
+```
+
+
+
